@@ -1,0 +1,294 @@
+---
+name: minimal-tcp-router
+# modified from cf-deployment
+update:
+  canaries: 1
+  canary_watch_time: 30000-1200000
+  max_in_flight: 1
+  serial: false
+  update_watch_time: 5000-1200000
+
+instance_groups:
+
+- name: consul
+  azs:
+  - z1
+  instances: 1
+  persistent_disk_type: 5GB
+  vm_type: minimal
+  stemcell: default
+  update:
+    serial: true
+  networks:
+  - name: default
+  jobs:
+  - name: consul_agent
+    release: consul
+    consumes:
+      consul_common: {from: consul_common_link}
+      consul_server: {from: consul_server_link}
+      consul_client: {from: consul_client_link}
+    provides:
+      consul_common: {as: consul_common_link, shared: true}
+      consul_server: {as: consul_server_link, shared: true}
+      consul_client: {as: consul_client_link, shared: true}
+    properties:
+      consul:
+        agent:
+          mode: server
+          domain: cf.internal
+        encrypt_keys:
+        - "((consul_encrypt_key))"
+        agent_cert: "((consul_agent.certificate))"
+        agent_key: "((consul_agent.private_key))"
+        ca_cert: "((consul_agent.ca))"
+        server_cert: "((consul_server.certificate))"
+        server_key: "((consul_server.private_key))"
+
+- name: database
+  azs:
+  - z1
+  persistent_disk_type: 1GB
+  instances: 1
+  vm_type: small
+  stemcell: default
+  update:
+    serial: true
+  networks:
+  - name: default
+  jobs:
+  - name: consul_agent
+    release: consul
+    consumes:
+      consul_common: {from: consul_common_link}
+      consul_server: nil
+      consul_client: {from: consul_client_link}
+  - name: mysql
+    release: cf-mysql
+    properties:
+      network_name: default
+      cf_mysql:
+        mysql:
+          admin_password: "((cf_mysql_mysql_admin_password))"
+          port: 33306
+          binlog_enabled: false
+          cluster_health:
+            password: "((cf_mysql_mysql_cluster_health_password))"
+          galera_healthcheck:
+            db_password: "((cf_mysql_mysql_galera_healthcheck_password))"
+            endpoint_username: galera_healthcheck
+            endpoint_password: "((cf_mysql_mysql_galera_healthcheck_endpoint_password))"
+          seeded_databases:
+          - name: routing-api
+            username: routing-api
+            password: "((routing_api_database_password))"
+  - name: proxy
+    release: cf-mysql
+    properties:
+      cf_mysql:
+        proxy:
+          api_password: "((cf_mysql_proxy_api_password))"
+          consul_enabled: true
+          consul_service_name: "sql-db"
+
+- name: api
+  azs:
+  - z1
+  instances: 1
+  vm_type: small
+  vm_extensions:
+  - 50GB_ephemeral_disk
+  stemcell: default
+  networks:
+  - name: default
+  jobs:
+  - name: consul_agent
+    release: consul
+    consumes:
+      consul_common: {from: consul_common_link}
+      consul_server: nil
+      consul_client: {from: consul_client_link}
+    properties:
+      consul:
+        agent:
+          services:
+            routing-api: {}
+  - name: routing-api
+    release: routing
+    properties:
+      routing_api:
+        system_domain: "((system_domain))"
+        auth_disabled: true
+        router_groups:
+        - name: default-tcp
+          type: tcp
+          reservable_ports: 60000-60099
+        sqldb:
+          host: sql-db.service.cf.internal
+          type: mysql
+          port: 3306
+          schema: routing-api
+          username: routing-api
+          password: "((routing_api_database_password))"
+      uaa:
+        tls_port: 0
+
+- name: tcp-router
+  azs:
+  - z1
+  instances: 1
+  vm_type: minimal
+  stemcell: default
+  vm_extensions:
+  - cf-tcp-router-network-properties
+  networks:
+  - name: default
+    static_ips: [ 10.0.31.192 ]
+  jobs:
+  - name: consul_agent
+    release: consul
+    consumes:
+      consul_common: {from: consul_common_link}
+      consul_server: nil
+      consul_client: {from: consul_client_link}
+  - name: tcp_router
+    release: routing
+    properties:
+      routing_api:
+        auth_disabled: true
+      tcp_router:
+        oauth_secret: "((uaa_clients_tcp_router_secret))"
+        router_group: default-tcp
+      uaa:
+        tls_port: 0
+
+- name: gostatic
+  instances: 1
+  vm_type: c3.large
+  stemcell: trusty
+  azs: [z1]
+  jobs:
+  - name: gostatic
+    release: routing-perf
+    provides:
+      static: {as: gostatic}
+    properties:
+      gostatic:
+        response_size: 1
+  networks:
+  - name: default
+
+- name: tcp_route_populator
+  instances: 1
+  vm_type: default
+  stemcell: trusty
+  azs: [z1]
+  jobs:
+  - name: tcp_route_populator
+    release: routing-perf
+    consumes:
+      static: {from: gostatic}
+    properties:
+      tcp_route_populator:
+        routing_api_url: http://routing-api.service.cf.internal:3000
+        external_port_start: 30000
+        external_port_end: 30999
+        sleep_interval: 10
+  networks:
+  - name: default
+
+
+- name: tcp_performance_tests
+  instances: 1
+  vm_type: n1-highcpu-16
+  stemcell: trusty
+  azs:
+  - z1
+  jobs:
+  - name: performance_tests
+    release: routing-perf
+    properties:
+      performance_tests:
+        routers:
+        - address: 10.0.31.192  ## TODO: this should consume a link instead
+          tag: tcp-router
+        host: some-tcp-host
+        port: 30001
+        protocol: http
+        num_requests: 1500160
+        concurrent_requests: 64
+        throughput_lower_limit: 20000
+        latency_upper_limit_90: 2
+        latency_upper_limit_95: 2
+        latency_upper_limit_99: 4
+        routing_release_version: ROUTING_RELEASE_VERSION
+        datadog_api_key: "((datadog_api_key))"
+  lifecycle: errand
+  networks:
+  - name: default
+
+variables:
+- name: cf_mysql_mysql_admin_password
+  type: password
+- name: cf_mysql_mysql_cluster_health_password
+  type: password
+- name: cf_mysql_mysql_galera_healthcheck_endpoint_password
+  type: password
+- name: cf_mysql_mysql_galera_healthcheck_password
+  type: password
+- name: cf_mysql_proxy_api_password
+  type: password
+- name: routing_api_database_password
+  type: password
+- name: uaa_clients_tcp_router_secret
+  type: password
+- name: consul_encrypt_key
+  type: password
+- name: service_cf_internal_ca
+  type: certificate
+  options:
+    is_ca: true
+    common_name: internalCA
+- name: consul_agent_ca
+  type: certificate
+  options:
+    is_ca: true
+    common_name: consulCA
+- name: consul_agent
+  type: certificate
+  options:
+    ca: consul_agent_ca
+    common_name: consul_agent
+    extended_key_usage:
+    - client_auth
+    - server_auth
+    alternative_names:
+    - 127.0.0.1
+- name: consul_server
+  type: certificate
+  options:
+    ca: consul_agent_ca
+    common_name: server.dc1.cf.internal
+    extended_key_usage:
+    - client_auth
+    - server_auth
+
+releases:
+- name: cf-mysql
+  url: https://storage.googleapis.com/cf-deployment-compiled-releases/cf-mysql-36.10.0-ubuntu-trusty-3468.15-20171216-002427-0134372.tgz
+  version: 36.10.0
+  sha1: dadf405f2305b6f9b625c1e07bd58aa93caf3cbc
+- name: consul
+  url: https://storage.googleapis.com/cf-deployment-compiled-releases/consul-190-ubuntu-trusty-3468.15-20171215-235612-552485797.tgz
+  version: "190"
+  sha1: 7a3dcd5a85fdedc8233b2e68b8aa9d97c46c3611
+- name: routing
+  version: latest
+
+- name: routing-perf
+  version: latest
+
+stemcells:
+- alias: default
+  os: ubuntu-trusty
+  version: "3468.15"
