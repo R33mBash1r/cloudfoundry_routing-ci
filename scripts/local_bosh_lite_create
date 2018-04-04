@@ -1,11 +1,15 @@
 #!/bin/bash
 
-set -e -u
+set -eu
 set -o pipefail
 
 env_dir=${HOME}/workspace/deployments-routing/lite
 cf_deployment_dir=${HOME}/workspace/cf-deployment
 bosh_deployment_dir=${HOME}/workspace/bosh-deployment
+
+if  [ -f "${env_dir}/state.json" ]; then
+echo "Heads up: you have existing local bosh-lite deployment artifacts in ${env_dir}."
+fi
 
 bosh create-env ${bosh_deployment_dir}/bosh.yml \
 --state $env_dir/state.json \
